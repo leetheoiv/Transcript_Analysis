@@ -1,0 +1,30 @@
+pydantic>=2.0
+psycopg2-binary
+pytest
+langchain
+langchain-core
+langchain-community
+langchain-classic
+# Data analysis
+pandas
+openpyxl
+scipy
+statsmodels
+numpy
+
+# API + config
+requests
+tomllib; python_version < "3.11"
+
+# UI + reporting
+streamlit
+reportlab
+python-pptx
+Pillow
+
+# Existing project deps
+pydantic
+
+# Task queue
+celery[redis]>=5.3
+redis>=5.0
