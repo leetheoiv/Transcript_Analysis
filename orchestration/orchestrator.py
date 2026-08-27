@@ -17,7 +17,7 @@ from agents.schema_generator_agent import SchemaGeneratorAgent
 from agents.ExtractionAgent import TranscriptExtractionAgent
 from agents.JudgeAgent import JudgeAgent
 import pandas as pd
-from utils.human_in_the_loop import HITL
+from utils.hitl_strategy import HITLStrategy, TerminalHITL
 from utils.bootstrap_extraction import ExtractionBootstrapEvaluator
 from tools.utils.load_schema_model import load_model_from_path
 from tools.DIRECTORY_TOOLS.create_folder import create_folder
@@ -25,6 +25,7 @@ from data_models.prompt_datamodel import PromptManagement
 from utils.save_file import save_file
 
 from tools.EVAL_TOOLS.aggregate_judge_results import aggregate_judge_results
+from tools.CATEGORY_TOOLS.category_registry import make_category_registry_tools
 from data_models.judge_aggregation import JudgeAggregation
 
 from orchestration.exceptions import (
@@ -59,7 +60,9 @@ class Orchestrator:
         TranscriptExtractionAgent: TranscriptExtractionAgent | None = None,
         JudgeAgent: JudgeAgent | None = None,
         output_dir: str | None = None,
-        project_name:str = None
+        project_name:str = None,
+        hitl_strategy: HITLStrategy | None = None,
+        use_category_registry: bool = False,
     ):
         """Initialize the orchestrator with data, agents, and output configuration.
 
@@ -73,6 +76,11 @@ class Orchestrator:
             JudgeAgent: Optional grounding judge agent for quality evaluation.
             output_dir: Base directory for all pipeline output files.
             project_name: Project identifier used in filenames and folder structure.
+            hitl_strategy: Pluggable HITL strategy. Defaults to TerminalHITL (input()-based).
+                Use AsyncHITL when running behind the API for HTTP-driven reviews.
+            use_category_registry: If True, creates a category registry CSV in the output
+                directory and provides lookup_category/register_category tools to the
+                extraction agent. This ensures consistent categorization across transcripts.
 
         Raises:
             ConfigurationError: If df is not a valid non-empty DataFrame or prompt is empty.
@@ -114,6 +122,7 @@ class Orchestrator:
         self.schema_agent = SchemaAgent
         self.extraction_agent = TranscriptExtractionAgent
         self.judge_agent = JudgeAgent
+        self.hitl_strategy = hitl_strategy or TerminalHITL()
         
 
         self.prompt_result = None
@@ -128,6 +137,18 @@ class Orchestrator:
         self.final_status: str = "UNKNOWN"
         self.transcript_column_name = "TRANSCRIPT"
         self.prompt_management: PromptManagement | None = None
+        
+        # Category registry for controlled vocabulary during extraction
+        self.use_category_registry = use_category_registry
+        self.category_registry_path: str | None = None
+        self.category_tools: tuple | None = None
+        
+        if use_category_registry:
+            self.category_registry_path = fr'{self.output_dir}\{self.project_name}_categories.csv'
+            self.category_tools = make_category_registry_tools(self.category_registry_path)
+            logger.info(
+                "Category registry enabled — file: %s", self.category_registry_path
+            )
    
 
         
@@ -154,8 +175,13 @@ class Orchestrator:
         allow_notes: bool = True,
         default: str | None = None,
     ):
-        """Pause workflow and request human approval/input."""
-        return HITL(
+        """Pause workflow and request human approval/input via the pluggable strategy.
+
+        When running from a script/notebook, this uses TerminalHITL (blocks on input()).
+        When running behind the API, this uses AsyncHITL (blocks on threading.Event,
+        resumes when the API receives a decision).
+        """
+        return self.hitl_strategy.request_decision(
             item_for_review=item_for_review,
             prompt=prompt,
             actions=actions,
@@ -633,11 +659,17 @@ class Orchestrator:
                 context={"available_columns": list(self.df.columns)},
             )
 
+        # Pass category tools as extra_tools so each per-row agent gets them
+        agent_init_kwargs = {}
+        if self.category_tools:
+            agent_init_kwargs["extra_tools"] = list(self.category_tools)
+
         self.evaluator = ExtractionBootstrapEvaluator(
-            rows=self.df.iloc[:, :].to_dict("records"),
+            rows=self.df.rename(columns=str.upper).iloc[:, :].to_dict("records"),
             agent_cls=TranscriptExtractionAgent,
             model=model,
             temperature=temperature,
+            **agent_init_kwargs,
         )
 
     def _run_first_extraction(
@@ -918,12 +950,131 @@ class Orchestrator:
 
         if failures:
             self.final_status = "FAIL"
+            self._failure_reasons = failures
             logger.warning("Assessment FAILED:\n  - %s", "\n  - ".join(failures))
         else:
             self.final_status = "PASS"
+            self._failure_reasons = []
             logger.info("Assessment PASSED.")
 
         return self.final_status
+
+    def _build_revision_brief(
+        self,
+        aggregation: JudgeAggregation | None,
+        min_correctness_rate: float | None = None,
+        min_consistency_rate: float | None = None,
+        max_hallucination_rate: float | None = None,
+    ) -> str:
+        """Build a comprehensive revision brief combining threshold failures,
+        consistency scores, and judge aggregation feedback.
+
+        This gives the prompt generator full context on WHY the pipeline failed
+        and WHERE the issues are — both correctness and consistency.
+
+        Args:
+            aggregation: Judge aggregation results (may be None if judging was skipped).
+            min_correctness_rate: The correctness threshold that was set.
+            min_consistency_rate: The consistency threshold that was set.
+            max_hallucination_rate: The hallucination threshold that was set.
+
+        Returns:
+            Formatted revision brief text for the prompt generator.
+        """
+        lines: list[str] = []
+
+        # --- Section 1: Pipeline Status & Threshold Failures ---
+        lines.append("## Pipeline Assessment: FAILED")
+        lines.append("")
+        lines.append("The extraction prompt did not meet quality thresholds. "
+                     "Below is a summary of what failed and why.")
+        lines.append("")
+
+        if hasattr(self, "_failure_reasons") and self._failure_reasons:
+            lines.append("### Threshold Violations")
+            lines.append("")
+            for reason in self._failure_reasons:
+                lines.append(f"- **FAILED:** {reason}")
+            lines.append("")
+
+        # --- Section 2: Overall Scores ---
+        if self.evaluation_result:
+            semantic = self.evaluation_result.semantic_quality
+            consistency = self.evaluation_result.consistency_quality
+
+            lines.append("### Current Performance Scores")
+            lines.append("")
+            lines.append(f"| Metric | Score | Threshold | Status |")
+            lines.append(f"|--------|-------|-----------|--------|")
+
+            # Correctness
+            corr_status = "PASS" if (min_correctness_rate is None or semantic.correctness_rate >= min_correctness_rate) else "FAIL"
+            lines.append(
+                f"| Correctness Rate | {semantic.correctness_rate:.1%} | "
+                f"{min_correctness_rate:.1%} | {corr_status} |"
+                if min_correctness_rate is not None else
+                f"| Correctness Rate | {semantic.correctness_rate:.1%} | — | — |"
+            )
+
+            # Consistency
+            cons_status = "PASS" if (min_consistency_rate is None or consistency.consistency_rate >= min_consistency_rate) else "FAIL"
+            lines.append(
+                f"| Consistency Rate | {consistency.consistency_rate:.1%} | "
+                f"{min_consistency_rate:.1%} | {cons_status} |"
+                if min_consistency_rate is not None else
+                f"| Consistency Rate | {consistency.consistency_rate:.1%} | — | — |"
+            )
+
+            # Hallucination
+            hall_status = "PASS" if (max_hallucination_rate is None or semantic.hallucination_rate <= max_hallucination_rate) else "FAIL"
+            lines.append(
+                f"| Hallucination Rate | {semantic.hallucination_rate:.1%} | "
+                f"≤{max_hallucination_rate:.1%} | {hall_status} |"
+                if max_hallucination_rate is not None else
+                f"| Hallucination Rate | {semantic.hallucination_rate:.1%} | — | — |"
+            )
+            lines.append("")
+
+            # --- Section 3: Per-Field Consistency Breakdown ---
+            per_field_consistency = self.evaluation_result.per_field_consistency_rate
+            if per_field_consistency:
+                lines.append("### Per-Field Consistency Rates")
+                lines.append("")
+                lines.append("Fields with low consistency produce different answers across "
+                             "repeated extractions of the same transcript. The prompt needs "
+                             "to be more specific/constrained for these fields.")
+                lines.append("")
+
+                # Sort worst first
+                sorted_fields = sorted(per_field_consistency.items(), key=lambda x: x[1])
+                for field_name, rate in sorted_fields:
+                    flag = " ⚠️ LOW" if rate < (min_consistency_rate or 0.8) else ""
+                    lines.append(f"- {field_name}: {rate:.1%}{flag}")
+                lines.append("")
+
+            # --- Section 4: Per-Field Correctness Breakdown ---
+            per_field_correctness = self.evaluation_result.per_field_correctness_rate
+            if per_field_correctness:
+                lines.append("### Per-Field Correctness Rates")
+                lines.append("")
+                lines.append("Fields with low correctness are producing answers that don't "
+                             "match the transcript evidence. The prompt instructions for "
+                             "these fields may be ambiguous or under-specified.")
+                lines.append("")
+
+                sorted_fields = sorted(per_field_correctness.items(), key=lambda x: x[1])
+                for field_name, rate in sorted_fields:
+                    flag = " ⚠️ LOW" if rate < (min_correctness_rate or 0.8) else ""
+                    lines.append(f"- {field_name}: {rate:.1%}{flag}")
+                lines.append("")
+
+        # --- Section 5: Judge Aggregation Detail ---
+        if aggregation:
+            lines.append("---")
+            lines.append("")
+            lines.append(aggregation.to_revision_brief_text())
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -1147,9 +1298,27 @@ class Orchestrator:
                     logger.warning("No judge feedback to aggregate — stopping revision loop.")
                     break
 
-                # 7b: Feed aggregated brief to prompt generator
-                revision_brief_text = aggregation.to_revision_brief_text()
-                logger.info("Feeding judge aggregation to prompt generator for revision.")
+                # 7b: Build comprehensive revision brief with threshold failures,
+                # consistency scores, and judge feedback — then feed to prompt generator
+                revision_brief_text = self._build_revision_brief(
+                    aggregation=aggregation,
+                    min_correctness_rate=min_correctness_rate,
+                    min_consistency_rate=min_consistency_rate,
+                    max_hallucination_rate=max_hallucination_rate,
+                )
+
+                # Save the revision brief to .md for traceability
+                brief_filename = f"{self.project_name}_revision_brief_cycle_{revision_cycles_used}"
+                save_file(
+                    content=revision_brief_text,
+                    filename=brief_filename,
+                    output_dir=self.output_dir,
+                    extension=".md",
+                    overwrite=True,
+                )
+                logger.info("Revision brief saved to %s/%s.md", self.output_dir, brief_filename)
+
+                logger.info("Feeding comprehensive revision brief to prompt generator.")
                 self._regenerate_prompt(revision_brief=revision_brief_text)
                 self._save_prompt_to_file()
                 logger.info(

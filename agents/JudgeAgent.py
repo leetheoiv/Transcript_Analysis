@@ -263,21 +263,24 @@ class JudgeAgent(BaseToolAgent):
         Retrieve candidate transcript evidence for a field.
 
         Retrieval order:
-        1. Try direct quote search if quote is provided.
-        2. Generate refined search terms with the LLM using quote/reasoning/task prompt.
-        3. Search transcript using refined terms.
-        4. Return whether evidence was found, the evidence chunk, and search terms used.
+        1. Try direct quote search if quote is provided (splits long quotes into
+           sentence fragments for better matching across line boundaries).
+        2. Extract n-gram fragments from the quote as search terms (no LLM call needed).
+        3. Generate refined search terms with the LLM using quote/reasoning/task prompt.
+        4. Search transcript using refined terms.
+        5. Return whether evidence was found, the evidence chunk, and search terms used.
         """
         quote = (field_input.quote or "").strip()
         evidence_chunk = ""
         zero_usage = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-            }               
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
 
-        # 1. Direct quote search first
+        # 1. Direct quote search — split into sentence fragments for better matching
         if quote:
+            # First try the full quote
             evidence_chunk = find_transcript_chunk_merged(
                 transcript,
                 quote,
@@ -288,10 +291,47 @@ class JudgeAgent(BaseToolAgent):
             if evidence_chunk and evidence_chunk.strip():
                 return True, evidence_chunk, [], zero_usage
 
-        # 2. Generate refined search terms with LLM
-        refined_terms,term_usage = self._generate_search_terms_with_llm(field_input)
+            # If full quote fails, split into sentence-level fragments and search each
+            import re
+            fragments = [
+                frag.strip()
+                for frag in re.split(r'[.!?;]+', quote)
+                if len(frag.strip()) > 10
+            ]
+            if fragments:
+                evidence_chunk = find_transcript_chunk_merged(
+                    transcript,
+                    fragments,
+                    context_lines=context_lines,
+                    formatted=True,
+                    include_search_term_label=True,
+                )
+                if evidence_chunk and evidence_chunk.strip():
+                    return True, evidence_chunk, fragments, zero_usage
 
-        # 3. Search with refined terms
+        # 2. Extract n-gram phrases from the quote directly (no LLM call)
+        if quote:
+            ngram_terms = generate_ngram_search_terms(
+                quote,
+                ngram_range=(2, 4),
+                top_k=8,
+                stop_words="bilingual",
+            )
+            if ngram_terms:
+                evidence_chunk = find_transcript_chunk_merged(
+                    transcript,
+                    ngram_terms,
+                    context_lines=context_lines,
+                    formatted=True,
+                    include_search_term_label=True,
+                )
+                if evidence_chunk and evidence_chunk.strip():
+                    return True, evidence_chunk, ngram_terms, zero_usage
+
+        # 3. Generate refined search terms with LLM
+        refined_terms, term_usage = self._generate_search_terms_with_llm(field_input)
+
+        # 4. Search with refined terms
         if refined_terms:
             evidence_chunk = find_transcript_chunk_merged(
                 transcript,
@@ -301,12 +341,12 @@ class JudgeAgent(BaseToolAgent):
                 include_search_term_label=True,
             )
             if evidence_chunk and evidence_chunk.strip():
-                return True, evidence_chunk, refined_terms,term_usage
+                return True, evidence_chunk, refined_terms, term_usage
 
             no_result_chunk = f"Search term: {' | '.join(refined_terms)} [YIELDED NO RESULTS]"
-            return False, no_result_chunk, refined_terms,term_usage
+            return False, no_result_chunk, refined_terms, term_usage
 
-        return False, "[NO SEARCH TERMS GENERATED]", [],zero_usage    
+        return False, "[NO SEARCH TERMS GENERATED]", [], zero_usage    
 
     def _judge_one_field(
         self,
@@ -315,6 +355,7 @@ class JudgeAgent(BaseToolAgent):
         context_lines: int = 2,
         system_prompt: str = SYSTEM_PROMPT,
         user_prompt_template: str = USER_PROMPT,
+        extra_template_params: dict | None = None,
     ) -> JudgeFieldResult:
         """
         Retrieve transcript evidence for a single field, then ask the LLM to judge
@@ -326,16 +367,24 @@ class JudgeAgent(BaseToolAgent):
             context_lines=context_lines,
         )
 
+        # Build field-level params — these are the core placeholders in the judge prompt
         prompt_params = {
-        "task_prompt": field_input.task_prompt or "",
-        "field_name": field_input.field_name,
-        "claim_value": field_input.claim_value,
-        "quote": field_input.quote or "",
-        "ai_reasoning": field_input.ai_reasoning or "",
-        "evidence_chunk": evidence_chunk if evidence_chunk else "[No relevant evidence found.]",
-    }
+            "task_prompt": field_input.task_prompt or "",
+            "field_name": field_input.field_name,
+            "claim_value": field_input.claim_value,
+            "quote": field_input.quote or "",
+            "ai_reasoning": field_input.ai_reasoning or "",
+            "evidence_chunk": evidence_chunk if evidence_chunk else "[No relevant evidence found.]",
+        }
 
-        user_content = self._render_user_prompt(user_prompt_template, prompt_params)
+        # Merge any extra template params (e.g. row-level data), but field-level
+        # params take precedence so they can never be overwritten
+        if extra_template_params:
+            merged_params = {**extra_template_params, **prompt_params}
+        else:
+            merged_params = prompt_params
+
+        user_content = self._render_user_prompt(user_prompt_template, merged_params)
         messages = self._build_messages(system_prompt, user_content)
 
         result = self.chat(
@@ -401,20 +450,15 @@ class JudgeAgent(BaseToolAgent):
             A list of per-field JudgeFieldResult objects.
         """
         results = []
-        if template_params:
-            rendered_user_prompt = self._render_user_prompt(user_prompt_template, template_params)
-            rendered_system_prompt = self._render_user_prompt(system_prompt, template_params)
-        else:
-            rendered_user_prompt = user_prompt_template
-            rendered_system_prompt = system_prompt
 
         for field_input in field_inputs:
             result = self._judge_one_field(
                 transcript=transcript,
                 field_input=field_input,
                 context_lines=context_lines,
-                system_prompt=rendered_system_prompt,
-                user_prompt_template=rendered_user_prompt,
+                system_prompt=system_prompt,
+                user_prompt_template=user_prompt_template,
+                extra_template_params=template_params,
             )
             results.append(result)
         
@@ -463,11 +507,14 @@ class JudgeAgent(BaseToolAgent):
                     row_agent = self._make_row_agent()
                     transcript = row.get(transcript_column_name, "")
 
-                    params = (
-                        template_params(row)
-                        if callable(template_params)
-                        else {k: row.get(v) for k, v in template_params.items()}
-                                        )
+                    if template_params:
+                        params = (
+                            template_params(row)
+                            if callable(template_params)
+                            else {k: row.get(v) for k, v in template_params.items()}
+                        )
+                    else:
+                        params = None
 
                     field_inputs = self.build_judge_field_inputs(row, judge_config)
                     print("FIELD_INPUTS:", field_inputs)

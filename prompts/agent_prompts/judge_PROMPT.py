@@ -59,7 +59,7 @@ Respond ONLY in the following JSON format:
   "evidence_strength": "one of: none, low, medium, high",
   "evidence_found": "boolean",
   "explanation": "brief explanation",
-  "error_type": "string",
-  "prompt_adjustment_suggestion":"string"
+  "error_type": "one of: unsupported_claim, wrong_extraction, missing_from_context, overgeneralization, ambiguous_evidence, bad_search_terms, formatting_only, not_hallucinated_but_unverifiable, other (or null if the claim is grounded)",
+  "prompt_adjustment_suggestion": "string or null"
 }
 """

@@ -5,16 +5,20 @@ Your task is to create short phrases that are likely to appear verbatim or near-
 in a call transcript, based on the extraction task prompt, field, claim value, quote,
 and reasoning.
 
+The transcript may be in English or Spanish. Generate search terms in the same language
+as the quote and reasoning provided.
+
 Rules:
 - Prefer short, concrete phrases, usually no more than {{MAX_WORDS}}.
 - Prioritize phrases likely spoken by the agent or customer.
+- If a direct quote is available, extract key fragments from that quote — these are
+  the most likely to appear verbatim in the transcript.
 - Do not write explanations.
 - Do not restate the reasoning in sentence form.
 - Do not use abstract labels like "value addition opportunity" unless that exact phrase
   is likely to appear in the transcript.
 - Avoid long sentences.
 - Return only useful search phrases.
-- If a direct quote is available, prefer phrases drawn from or close to that quote.
 """.strip()
 
 

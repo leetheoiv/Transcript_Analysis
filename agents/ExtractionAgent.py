@@ -223,6 +223,8 @@ class TranscriptExtractionAgent(BaseToolAgent):
         """Extract from a transcript by injecting the full text directly into the prompt.
 
         Used for shorter transcripts that fit within token limits.
+        When category tools are registered, uses the agent loop to handle
+        multi-step tool calls (lookup → register → extract).
 
         Args:
             transcript: Full transcript text.
@@ -239,13 +241,27 @@ class TranscriptExtractionAgent(BaseToolAgent):
         user_content = self._render_user_prompt(user_prompt_template, params)
         messages = self._build_messages(system_prompt, user_content)
 
+        # If category tools (or any tools) are registered, use the full agent loop
+        # so multi-step tool calls (lookup → register → final answer) resolve properly.
+        if self.tools:
+            result = self.run_agent(
+                messages=messages,
+                tools=self._tool_schemas(),
+                available_functions=self._available_functions(),
+                temperature=float(self.temperature),
+                max_iterations=5,
+            )
+            usage = self._empty_usage()
+            raw_text = result.get("response", "") if isinstance(result, dict) else str(result)
+            return raw_text.strip(), usage
+
         result = self.chat_with_tools(
             messages=messages,
             temperature=self.temperature,
             use_history=False,
         )
         usage = self.extract_usage_tokens(result)
-        return self._extract_chat_text(result),usage
+        return self._extract_chat_text(result), usage
     
     def _run_tool_mode(
         self,
@@ -513,10 +529,36 @@ class TranscriptExtractionAgent(BaseToolAgent):
         use_tool_mode = self.count_tokens(transcript) > token_threshold
         self._reset_search_terms()
 
+        # If category registry tools are registered, augment the system prompt
+        # so the LLM knows to use them for any categorical/classification fields.
+        effective_system_prompt = system_prompt
+        has_category_tools = any(
+            t.name in ("lookup_category", "register_category") for t in self.tools
+        )
+        if has_category_tools:
+            category_instruction = (
+                "\n\n[CATEGORY REGISTRY INSTRUCTIONS]\n"
+                "You have access to a category registry via the lookup_category and "
+                "register_category tools. The registry uses a two-level hierarchy: "
+                "Broad Category (high-level grouping) → Sub-Category (specific reason).\n\n"
+                "For ANY field that requires assigning a category, classification, or reason label:\n"
+                "1. FIRST call lookup_category with your proposed sub-category name.\n"
+                "2. If a match is found (found=true), use the EXACT broad_category and "
+                "sub_category names returned — do not invent your own variant.\n"
+                "3. If no match is found (found=false), call register_category with:\n"
+                "   - broad_category: high-level grouping (e.g., 'Billing', 'Technical Support')\n"
+                "   - broad_category_definition: what this broad category covers\n"
+                "   - sub_category: specific reason (e.g., 'Payment Dispute', 'Signal Loss')\n"
+                "   - sub_category_definition: what this sub-category specifically covers\n"
+                "4. Then use the registered broad_category and sub_category in your extraction output.\n"
+                "This ensures consistent categorization across all transcripts."
+            )
+            effective_system_prompt = (system_prompt or "") + category_instruction
+
         if not use_tool_mode:
             raw_text,usage_totals = self._run_inline_mode(
                 transcript=transcript,
-                system_prompt=system_prompt,
+                system_prompt=effective_system_prompt,
                 user_prompt_template=user_prompt_template,
                 template_params=params,
             )
@@ -526,7 +568,7 @@ class TranscriptExtractionAgent(BaseToolAgent):
         else:
             raw_text, search_terms,found_any,matched_evidence,usage_totals = self._run_tool_mode(
                 transcript=transcript,
-                system_prompt=system_prompt,
+                system_prompt=effective_system_prompt,
                 user_prompt_template=user_prompt_template,
                 temperature=temperature,
                 max_iterations=max_iterations,
@@ -595,6 +637,9 @@ class TranscriptExtractionAgent(BaseToolAgent):
     def _make_row_agent(self):
         """Create a fresh TranscriptExtractionAgent instance for per-row processing.
 
+        Propagates extra_tools so that shared tools (e.g., category registry)
+        are available to each per-row agent instance.
+
         Returns:
             A new TranscriptExtractionAgent with the same configuration as self.
         """        
@@ -603,6 +648,7 @@ class TranscriptExtractionAgent(BaseToolAgent):
             assistant_id=getattr(self, "assistant_id", None),
             model=self.model,
             temperature=self.temperature,
+            extra_tools=self.tools if self.tools else None,
             enable_tool_logging=self.enable_tool_logging,
         )
 
@@ -656,6 +702,7 @@ class TranscriptExtractionAgent(BaseToolAgent):
             List of result dicts
         """
         def _process(row):
+            
             sessionid = row.get("AGENTRECORDINGSESSIONID")
             print("Processing Session ID:", sessionid)
 
