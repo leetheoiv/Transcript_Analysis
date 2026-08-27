@@ -253,6 +253,42 @@ class JudgeAgent(BaseToolAgent):
         return terms,usage
     
 
+    def _extract_short_snippets(self, text: str, max_words: int = 5) -> list[str]:
+        """Extract overlapping short word-window snippets from text.
+
+        Produces search-friendly fragments by sliding a word window across
+        the text. Filters out snippets that are too short to be useful.
+
+        Args:
+            text: Source text to extract snippets from.
+            max_words: Number of words per snippet window.
+
+        Returns:
+            List of unique snippet strings, each containing max_words consecutive words.
+        """
+        import re
+        # Clean the text: remove speaker labels, punctuation noise
+        cleaned = re.sub(r'(Agent|Caller|Representative):\s*', '', text)
+        words = cleaned.split()
+
+        if len(words) <= max_words:
+            snippet = " ".join(words)
+            return [snippet] if len(snippet) > 8 else []
+
+        snippets = []
+        seen = set()
+        # Slide window with step of 2-3 words for overlap
+        step = max(2, max_words // 2)
+        for i in range(0, len(words) - max_words + 1, step):
+            snippet = " ".join(words[i:i + max_words])
+            # Skip very short or duplicate snippets
+            key = snippet.lower().strip()
+            if len(key) > 8 and key not in seen:
+                seen.add(key)
+                snippets.append(snippet)
+
+        return snippets
+
     def _retrieve_evidence(
         self,
         transcript: str,
@@ -263,14 +299,21 @@ class JudgeAgent(BaseToolAgent):
         Retrieve candidate transcript evidence for a field.
 
         Retrieval order:
-        1. Try direct quote search if quote is provided (splits long quotes into
-           sentence fragments for better matching across line boundaries).
-        2. Extract n-gram fragments from the quote as search terms (no LLM call needed).
-        3. Generate refined search terms with the LLM using quote/reasoning/task prompt.
-        4. Search transcript using refined terms.
-        5. Return whether evidence was found, the evidence chunk, and search terms used.
+        Phase 1 (Quote-based):
+          1a. Full quote search
+          1b. Sentence-level fragments from quote
+          1c. Short word-window snippets (3-5 words) from quote
+          1d. N-gram extraction from quote
+        Phase 2 (Reasoning-based):
+          2a. Short word-window snippets from reasoning
+          2b. N-gram extraction from reasoning
+        Phase 3 (LLM fallback):
+          3. LLM-generated refined search terms
         """
+        import re
+
         quote = (field_input.quote or "").strip()
+        reasoning = (field_input.ai_reasoning or "").strip()
         evidence_chunk = ""
         zero_usage = {
             "input_tokens": 0,
@@ -278,9 +321,9 @@ class JudgeAgent(BaseToolAgent):
             "total_tokens": 0,
         }
 
-        # 1. Direct quote search — split into sentence fragments for better matching
+        # --- PHASE 1: Quote-based retrieval ---
         if quote:
-            # First try the full quote
+            # 1a. Full quote search
             evidence_chunk = find_transcript_chunk_merged(
                 transcript,
                 quote,
@@ -291,11 +334,10 @@ class JudgeAgent(BaseToolAgent):
             if evidence_chunk and evidence_chunk.strip():
                 return True, evidence_chunk, [], zero_usage
 
-            # If full quote fails, split into sentence-level fragments and search each
-            import re
+            # 1b. Sentence-level fragments (split on punctuation + commas)
             fragments = [
                 frag.strip()
-                for frag in re.split(r'[.!?;]+', quote)
+                for frag in re.split(r'[.!?;,]+', quote)
                 if len(frag.strip()) > 10
             ]
             if fragments:
@@ -309,8 +351,20 @@ class JudgeAgent(BaseToolAgent):
                 if evidence_chunk and evidence_chunk.strip():
                     return True, evidence_chunk, fragments, zero_usage
 
-        # 2. Extract n-gram phrases from the quote directly (no LLM call)
-        if quote:
+            # 1c. Short word-window snippets from quote (4-word chunks)
+            quote_snippets = self._extract_short_snippets(quote, max_words=4)
+            if quote_snippets:
+                evidence_chunk = find_transcript_chunk_merged(
+                    transcript,
+                    quote_snippets[:10],
+                    context_lines=context_lines,
+                    formatted=True,
+                    include_search_term_label=True,
+                )
+                if evidence_chunk and evidence_chunk.strip():
+                    return True, evidence_chunk, quote_snippets[:10], zero_usage
+
+            # 1d. N-gram extraction from quote
             ngram_terms = generate_ngram_search_terms(
                 quote,
                 ngram_range=(2, 4),
@@ -328,10 +382,42 @@ class JudgeAgent(BaseToolAgent):
                 if evidence_chunk and evidence_chunk.strip():
                     return True, evidence_chunk, ngram_terms, zero_usage
 
-        # 3. Generate refined search terms with LLM
+        # --- PHASE 2: Reasoning-based retrieval ---
+        if reasoning:
+            # 2a. Short word-window snippets from reasoning
+            reasoning_snippets = self._extract_short_snippets(reasoning, max_words=4)
+            if reasoning_snippets:
+                evidence_chunk = find_transcript_chunk_merged(
+                    transcript,
+                    reasoning_snippets[:10],
+                    context_lines=context_lines,
+                    formatted=True,
+                    include_search_term_label=True,
+                )
+                if evidence_chunk and evidence_chunk.strip():
+                    return True, evidence_chunk, reasoning_snippets[:10], zero_usage
+
+            # 2b. N-gram extraction from reasoning
+            reasoning_ngrams = generate_ngram_search_terms(
+                reasoning,
+                ngram_range=(2, 4),
+                top_k=8,
+                stop_words="bilingual",
+            )
+            if reasoning_ngrams:
+                evidence_chunk = find_transcript_chunk_merged(
+                    transcript,
+                    reasoning_ngrams,
+                    context_lines=context_lines,
+                    formatted=True,
+                    include_search_term_label=True,
+                )
+                if evidence_chunk and evidence_chunk.strip():
+                    return True, evidence_chunk, reasoning_ngrams, zero_usage
+
+        # --- PHASE 3: LLM-generated search terms (last resort) ---
         refined_terms, term_usage = self._generate_search_terms_with_llm(field_input)
 
-        # 4. Search with refined terms
         if refined_terms:
             evidence_chunk = find_transcript_chunk_merged(
                 transcript,
@@ -557,6 +643,23 @@ class JudgeAgent(BaseToolAgent):
         f = open(output_file, "a", newline="", encoding="utf-8") if output_file else None
         seen_agentrecordingsessionid = set()
 
+        # Pre-compute all expected fieldnames based on judge_config so the CSV
+        # writer handles rows consistently regardless of processing order.
+        _judge_suffixes = [
+            "", "_GROUNDED", "_HALLUCINATED", "_EVIDENCE_STRENGTH",
+            "_EVIDENCE_FOUND", "_EVIDENCE_CHUNK", "_SEARCH_TERMS_USED",
+            "_JUDGE_EXPLANATION", "_ERROR_TYPE", "_PROMPT_ADJUSTMENT_SUGGESTION",
+            "_LLM_INPUT_TOKENS", "_LLM_OUTPUT_TOKENS", "_LLM_TOTAL_TOKENS",
+        ]
+        expected_fieldnames = [session_id_column, "PROCESS_STATUS"]
+        if include_columns:
+            expected_fieldnames.extend(include_columns)
+        for cfg in judge_config:
+            field_name = cfg["field_name"]
+            for suffix in _judge_suffixes:
+                expected_fieldnames.append(f"{field_name}{suffix}")
+
+
         try:
             if max_workers == 1:
                 for i, row in enumerate(rows):
@@ -578,7 +681,10 @@ class JudgeAgent(BaseToolAgent):
 
                     if f:
                         if writer is None:
-                            writer = csv.DictWriter(f, fieldnames=result.keys())
+                            writer = csv.DictWriter(
+                                f, fieldnames=expected_fieldnames,
+                                extrasaction='ignore',
+                            )
                             if not file_exists:
                                 writer.writeheader()
                         writer.writerow(result)
@@ -607,7 +713,10 @@ class JudgeAgent(BaseToolAgent):
 
                         if f:
                             if writer is None:
-                                writer = csv.DictWriter(f, fieldnames=result.keys())
+                                writer = csv.DictWriter(
+                                    f, fieldnames=expected_fieldnames,
+                                    extrasaction='ignore',
+                                )
                                 if not file_exists:
                                     writer.writeheader()
                             writer.writerow(result)
