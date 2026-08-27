@@ -28,3 +28,8 @@ pydantic
 # Task queue
 celery[redis]>=5.3
 redis>=5.0
+
+# API
+fastapi>=0.141.1
+uvicorn[standard]>=0.34.0
+python-multipart>=0.0.20
