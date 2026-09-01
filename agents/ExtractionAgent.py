@@ -272,8 +272,12 @@ class TranscriptExtractionAgent(BaseToolAgent):
                 temperature=float(self.temperature),
                 max_iterations=5,
             )
-            usage = self._empty_usage()
-            raw_text = result.get("response", "") if isinstance(result, dict) else str(result)
+            if isinstance(result, dict):
+                raw_text = result.get("response", "")
+                usage = result.get("usage") or self._empty_usage()
+            else:
+                raw_text = str(result)
+                usage = self._empty_usage()
             return raw_text.strip(), usage
 
         result = self.chat_with_tools(

@@ -53,7 +53,7 @@ class Orchestrator:
     def __init__(
         self,
         df: pd.DataFrame,
-        prompt: str,
+        prompt: str | None = None,
         knowledge_base_output_location: str | None = None,
         PromptAgent: PromptGeneratorAgent | None = None,
         SchemaAgent: SchemaGeneratorAgent | None = None,
@@ -67,6 +67,9 @@ class Orchestrator:
         progress_callback=None,
         gold_labels: "pd.DataFrame | dict | None" = None,
         correctness_source: str = "judge",
+        prebuilt_system_prompt: str | None = None,
+        prebuilt_user_prompt: str | None = None,
+        prebuilt_output_format: dict | None = None,
     ):
         """Initialize the orchestrator with data, agents, and output configuration.
 
@@ -97,6 +100,18 @@ class Orchestrator:
             correctness_source: Which correctness signal drives PASS/FAIL and the
                 revision loop: 'judge' (default, judge grounding) or 'gold'
                 (ground-truth labels). 'gold' requires gold_labels.
+            prebuilt_user_prompt: Optional ready-made extraction USER prompt. When
+                provided, the prompt-generation step is SKIPPED entirely (the
+                PromptGeneratorAgent is not called) and this prompt is used as-is.
+                It must contain the ``{{TRANSCRIPT}}`` Jinja2 slot the extractor
+                fills in. Supplying this makes PromptAgent optional.
+            prebuilt_system_prompt: Optional system prompt to pair with
+                prebuilt_user_prompt. Defaults to empty when omitted.
+            prebuilt_output_format: Optional JSON-schema dict describing the
+                expected output. Only needed if you also want automatic schema
+                generation; if you pass your own JudgeAgent/extraction schema
+                separately you can leave this None. Ignored unless
+                prebuilt_user_prompt is set.
 
         Raises:
             ConfigurationError: If df is not a valid non-empty DataFrame or prompt is empty.
@@ -115,14 +130,28 @@ class Orchestrator:
                 step="Init",
             )
 
-        if not prompt or not isinstance(prompt, str):
+        # `prompt` is the analyst question that drives prompt generation. It is
+        # required UNLESS a prebuilt prompt is supplied — in that case there is
+        # nothing to generate, so prompt is optional and used only as a record
+        # label.
+        has_prebuilt = prebuilt_user_prompt is not None
+        if not has_prebuilt and (not prompt or not isinstance(prompt, str)):
             raise ConfigurationError(
-                "A non-empty prompt string is required.",
+                "A non-empty prompt string is required (unless prebuilt_user_prompt "
+                "is provided).",
                 step="Init",
                 context={"received_type": type(prompt).__name__},
             )
+        if prompt is not None and not isinstance(prompt, str):
+            raise ConfigurationError(
+                "prompt must be a string when provided.",
+                step="Init",
+                context={"received_type": type(prompt).__name__},
+            )
+
         self.df = df
-        self.user_prompt = prompt
+        # Keep a usable label for records even when no analyst question was given.
+        self.user_prompt = prompt or "(prebuilt prompt supplied; no analyst question)"
         self.project_name = project_name
 
         # Resolve the project output folder robustly, regardless of the current
@@ -167,6 +196,13 @@ class Orchestrator:
         self.generated_user_prompt: str | None = None
         self.generated_schema: Any = None
         self.generated_prompt_output_format: str | None = None
+
+        # Optional caller-supplied ("prebuilt") prompt. When a user prompt is
+        # provided, prompt generation is skipped and this prompt is used as-is.
+        self.prebuilt_system_prompt = prebuilt_system_prompt
+        self.prebuilt_user_prompt = prebuilt_user_prompt
+        self.prebuilt_output_format = prebuilt_output_format
+        self.use_prebuilt_prompt = prebuilt_user_prompt is not None
 
         self.knowledge_base_output_location = knowledge_base_output_location
 
@@ -368,6 +404,41 @@ class Orchestrator:
     def _generate_prompt(self):
         """Generate prompt artifacts using the prompt agent, or fall back to user prompt."""
         logger.info("Step: Prompt Generation — starting")
+
+        # Caller supplied a ready-made prompt — skip generation entirely and use
+        # it as-is. This bypasses the PromptGeneratorAgent (which may be None).
+        if self.use_prebuilt_prompt:
+            logger.info("Using caller-supplied (prebuilt) prompt — skipping prompt generation.")
+
+            self.generated_system_prompt = self.prebuilt_system_prompt or ""
+            self.generated_user_prompt = self.prebuilt_user_prompt
+            self.generated_prompt_output_format = self.prebuilt_output_format
+
+            if "{{TRANSCRIPT}}" not in (self.generated_user_prompt or ""):
+                logger.warning(
+                    "Prebuilt user prompt does not contain the '{{TRANSCRIPT}}' slot — "
+                    "the extractor injects the transcript there, so extraction may not "
+                    "see the transcript. Add '{{TRANSCRIPT}}' where the transcript belongs."
+                )
+
+            from datetime import datetime, timezone
+            self.prompt_management = PromptManagement(
+                prompt_title=self.project_name or "untitled",
+                inital_user_prompt_request=self.user_prompt,
+                generated_system_prompt=self.generated_system_prompt,
+                generated_user_prompt=self.generated_user_prompt,
+                output_format=self.prebuilt_output_format or {},
+                metadata_fields=[],
+                saved_location_of_prompt=None,
+                model="prebuilt",
+                temperature=None,
+            )
+            self.prompt_management.updated_at = datetime.now(timezone.utc)
+
+            logger.info("Prebuilt prompt loaded (system %d chars, user %d chars).",
+                        len(self.generated_system_prompt or ""),
+                        len(self.generated_user_prompt or ""))
+            return self.generated_user_prompt
 
         if self.prompt_agent is None:
             logger.info("No prompt agent configured; using raw user prompt.")
@@ -1545,7 +1616,12 @@ class Orchestrator:
         self._report_phase("prompt_generation")
         self._generate_prompt()
 
-        if review_prompt:
+        # Skip the prompt review gate when the caller supplied the prompt — there
+        # is nothing to regenerate (no agent) and the prompt is authored by the
+        # user, so approve/retry cycles don't apply.
+        if review_prompt and self.use_prebuilt_prompt:
+            logger.info("Prebuilt prompt supplied — skipping the prompt review gate.")
+        elif review_prompt:
             while True:
                 self._report_phase("prompt_review", "Waiting for your review of the generated prompt")
                 decision = self._review_prompt()
@@ -1692,7 +1768,16 @@ class Orchestrator:
                 self.prompt_agent is not None
                 and run_judging
                 and max_revision_cycles > 0
+                # A caller-supplied prompt is authored by the user; the harness
+                # must not auto-rewrite it. Evaluation/judging still run so the
+                # user gets metrics, but the prompt is left as provided.
+                and not self.use_prebuilt_prompt
             )
+            if self.use_prebuilt_prompt and self.final_status == "FAIL" and max_revision_cycles > 0:
+                logger.info(
+                    "Prebuilt prompt supplied — skipping automated prompt revision "
+                    "(the caller's prompt is used as-is)."
+                )
 
             # Best-prompt tracking: remember the best-scoring prompt version seen
             # so far so a revision that REGRESSES quality never becomes the final
