@@ -50,6 +50,14 @@ Extractor Reasoning:
 Transcript Evidence:
 {{ evidence_chunk }}
 
+Also classify how the claim relates to the transcript evidence using `claim_presence`:
+- supported: the provided evidence supports the claim.
+- contradicted: the provided evidence directly contradicts the claim.
+- absent: the evidence is relevant context, but the specific claimed fact is genuinely NOT present in it (a real extraction error).
+- no_evidence: no usable transcript evidence was provided to evaluate against, so grounding cannot be determined either way. Use this ONLY when the evidence section is empty or explicitly indicates no relevant evidence was found.
+
+Important: Do NOT use "absent" when the evidence section indicates no evidence was retrieved — use "no_evidence" in that case. "absent" means you DID see relevant surrounding evidence and the claimed fact is not in it.
+
 Respond ONLY in the following JSON format:
 {
   "field_name": "string",
@@ -58,6 +66,7 @@ Respond ONLY in the following JSON format:
   "grounded": "boolean",
   "evidence_strength": "one of: none, low, medium, high",
   "evidence_found": "boolean",
+  "claim_presence": "one of: supported, contradicted, absent, no_evidence",
   "explanation": "brief explanation",
   "error_type": "one of: unsupported_claim, wrong_extraction, missing_from_context, overgeneralization, ambiguous_evidence, bad_search_terms, formatting_only, not_hallucinated_but_unverifiable, other (or null if the claim is grounded)",
   "prompt_adjustment_suggestion": "string or null"

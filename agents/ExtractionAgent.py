@@ -45,7 +45,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, get_args, get_origin
 from tools.utils.build_tool import Tool
 from jinja2 import Template
 from pydantic import BaseModel
@@ -64,6 +64,27 @@ class TranscriptExtractionAgent(BaseToolAgent):
     directly into the prompt. For longer transcripts, a search_transcript tool is
     used to locate relevant sections before extraction.
     """
+
+    @staticmethod
+    def _is_list_field(annotation) -> bool:
+        """Return True if a pydantic field annotation is a list/sequence type.
+
+        Handles ``list[str]``, ``List[str]``, ``Optional[list[str]]``
+        (i.e. ``Union[list[str], None]``), and bare ``list``. Used to tell the
+        LLM which category fields expect a LIST of categories (so each item is
+        run through the registry) versus a single category value.
+        """
+        origin = get_origin(annotation)
+        if origin in (list, tuple, set, frozenset):
+            return True
+        # Unwrap Optional[...] / Union[...] and check the members.
+        if origin is not None:
+            for arg in get_args(annotation):
+                if arg is type(None):
+                    continue
+                if TranscriptExtractionAgent._is_list_field(arg):
+                    return True
+        return annotation in (list, tuple, set, frozenset)
 
     def __init__(
         self,
@@ -357,6 +378,7 @@ class TranscriptExtractionAgent(BaseToolAgent):
                         messages=final_messages,
                         temperature=temperature,
                         use_history=False,
+                        tool_choice="none",
                     )
                     usage_totals = self._add_usage(usage_totals, self.extract_usage_tokens(final_result))
                     raw_text = self._extract_chat_text(final_result)
@@ -405,6 +427,7 @@ class TranscriptExtractionAgent(BaseToolAgent):
                         messages=final_messages,
                         temperature=temperature,
                         use_history=False,
+                        tool_choice="none",
                     )
                     raw_text = self._extract_chat_text(final_result)
 
@@ -457,6 +480,7 @@ class TranscriptExtractionAgent(BaseToolAgent):
                     messages=final_messages,
                     temperature=temperature,
                     use_history=False,
+                    tool_choice="none",
                 )
                 raw_text = self._extract_chat_text(final_result)
 
@@ -479,6 +503,7 @@ class TranscriptExtractionAgent(BaseToolAgent):
                 messages=final_messages,
                 temperature=temperature,
                 use_history=False,
+                tool_choice="none",
             )
             raw_text = self._extract_chat_text(final_result)
 
@@ -519,13 +544,26 @@ class TranscriptExtractionAgent(BaseToolAgent):
             template_params: Additional template variables.
             search_retry_limit: Retry count for failed searches in tool mode.
             max_search_terms: Max search terms per tool call.
-            retrieval_only_evidence: If True, only use retrieved chunks as evidence.
+            retrieval_only_evidence: If True, evidence is limited to chunks the
+                search tool actually retrieved (blank on a retrieval miss). If
+                False (default), a retrieval miss falls back to building an
+                evidence chunk from the transcript using the attempted search
+                terms, so the judge evaluates against real transcript text.
 
         Returns:
             Tuple of (validated_model, search_terms, found_any, matched_evidence, usage_totals).
             validated_model is None if validation fails.
         """
         params = dict(template_params or {})
+
+        # Guard against non-string transcripts. Pandas yields NaN (a float) for
+        # empty/missing cells, which breaks token counting downstream with
+        # "argument of type 'float' is not iterable". Coerce to a safe string.
+        if transcript is None or (isinstance(transcript, float) and pd.isna(transcript)):
+            transcript = ""
+        elif not isinstance(transcript, str):
+            transcript = str(transcript)
+
         use_tool_mode = self.count_tokens(transcript) > token_threshold
         self._reset_search_terms()
 
@@ -536,22 +574,89 @@ class TranscriptExtractionAgent(BaseToolAgent):
             t.name in ("lookup_category", "register_category") for t in self.tools
         )
         if has_category_tools:
+            # Derive the category field names from the response schema so the LLM
+            # is told exactly which `field` value to pass to the registry tools.
+            # Categorical fields follow the '*_claim_field' naming convention.
+            # We also detect which of those are LIST-typed (list[str]) so the
+            # instruction can tell the model to register EACH list item.
+            model_fields = getattr(response_format, "model_fields", {})
+            category_field_names = [
+                name for name in model_fields if name.endswith("_claim_field")
+            ]
+
+            list_field_names = [
+                name for name in category_field_names
+                if self._is_list_field(model_fields[name].annotation)
+            ]
+            scalar_field_names = [
+                name for name in category_field_names if name not in list_field_names
+            ]
+
+            if category_field_names:
+                lines = ["The category/classification fields in your output are:"]
+                for name in category_field_names:
+                    kind = "LIST of category strings" if name in list_field_names else "single category value"
+                    lines.append(f"   - {name}  ({kind})")
+                lines.append(
+                    "When calling the registry tools, the `field` argument MUST be one "
+                    "of these exact names.\n"
+                )
+                field_list_text = "\n".join(lines) + "\n"
+            else:
+                field_list_text = (
+                    "When calling the registry tools, the `field` argument MUST be the exact "
+                    "name of the output field you are currently assigning a category to "
+                    "(use the field name exactly as it appears in your output schema).\n\n"
+                )
+
+            # Extra guidance only emitted when at least one field is list-typed.
+            if list_field_names:
+                list_instruction = (
+                    "\nHANDLING LIST-TYPED CATEGORY FIELDS:\n"
+                    "The following fields expect a LIST of category strings: "
+                    + ", ".join(list_field_names) + ".\n"
+                    "For these fields, run the lookup/register cycle SEPARATELY for EACH "
+                    "category you intend to include:\n"
+                    "  a. For each candidate category, call lookup_category (field=<this field>, "
+                    "proposed_category=<the category>).\n"
+                    "  b. If found, use the returned sub_category; if not, register_category "
+                    "for it, then use the registered sub_category.\n"
+                    "  c. Collect the resulting canonical sub_category names into the output "
+                    "list. De-duplicate — if two candidates resolve to the same registered "
+                    "sub_category, include it only once.\n"
+                    "  d. If the list should be empty (e.g. condition not met), return an empty "
+                    "list and do NOT call the registry for that field.\n"
+                )
+            else:
+                list_instruction = ""
+
             category_instruction = (
                 "\n\n[CATEGORY REGISTRY INSTRUCTIONS]\n"
                 "You have access to a category registry via the lookup_category and "
                 "register_category tools. The registry uses a two-level hierarchy: "
                 "Broad Category (high-level grouping) → Sub-Category (specific reason).\n\n"
-                "For ANY field that requires assigning a category, classification, or reason label:\n"
-                "1. FIRST call lookup_category with your proposed sub-category name.\n"
+                "The registry is scoped PER FIELD: categories registered for one field are "
+                "kept separate from those of other fields, and lookups only return categories "
+                "for the field you specify. This keeps each field's vocabulary independent.\n\n"
+                + field_list_text
+                + "For ANY field that requires assigning a category, classification, or reason label "
+                "(this includes every item of a list-typed category field):\n"
+                "1. FIRST call lookup_category, passing:\n"
+                "   - field: the exact name of the output field you are assigning (see list above).\n"
+                "   - proposed_category: your proposed sub-category name.\n"
                 "2. If a match is found (found=true), use the EXACT broad_category and "
                 "sub_category names returned — do not invent your own variant.\n"
                 "3. If no match is found (found=false), call register_category with:\n"
+                "   - field: the SAME field name you used in the lookup.\n"
                 "   - broad_category: high-level grouping (e.g., 'Billing', 'Technical Support')\n"
                 "   - broad_category_definition: what this broad category covers\n"
                 "   - sub_category: specific reason (e.g., 'Payment Dispute', 'Signal Loss')\n"
                 "   - sub_category_definition: what this sub-category specifically covers\n"
                 "4. Then use the registered broad_category and sub_category in your extraction output.\n"
-                "This ensures consistent categorization across all transcripts."
+                + list_instruction
+                + "Always pass the correct `field` for the value you are assigning — never reuse a "
+                "different field's name. This ensures consistent, field-scoped categorization "
+                "across all transcripts."
             )
             effective_system_prompt = (system_prompt or "") + category_instruction
 
@@ -585,12 +690,58 @@ class TranscriptExtractionAgent(BaseToolAgent):
             raw_text = raw_text.split("\n", 1)[1].rsplit("\n```", 1)[0].strip()
 
         try:
-            validated = response_format.model_validate(self._safe_json_parse(raw_text))
+            parsed = self._safe_json_parse(raw_text)
+            parsed = self._unwrap_response_payload(parsed, response_format)
+            validated = response_format.model_validate(parsed)
             return validated, search_terms,found_any,matched_evidence,usage_totals
         
         except Exception as e:
             self._log(f"Validation failed: {e}")
             return None, search_terms,False,"",usage_totals
+
+    def _unwrap_response_payload(self, parsed, response_format):
+        """Unwrap a doubly-wrapped extraction payload.
+
+        Some responses come back nested inside a single ``response`` (or
+        ``output``/``result``) key as a stringified JSON blob, e.g.
+        ``{"response": "{...actual fields...}"}``. The actual extraction fields
+        the Pydantic model expects live one level down. This peels off that
+        wrapper so validation sees the real fields instead of a single-key dict.
+
+        Args:
+            parsed: Result of _safe_json_parse (usually a dict).
+            response_format: The target Pydantic model class.
+
+        Returns:
+            The unwrapped payload (dict) if a wrapper was detected and the inner
+            payload looks like the expected model; otherwise the original value.
+        """
+        if not isinstance(parsed, dict):
+            return parsed
+
+        try:
+            expected_fields = set(getattr(response_format, "model_fields", {}).keys())
+        except Exception:
+            expected_fields = set()
+
+        # If the parsed dict already exposes the expected fields, leave it alone.
+        if expected_fields and expected_fields & set(parsed.keys()):
+            return parsed
+
+        wrapper_keys = ("response", "output", "result", "data")
+        for key in wrapper_keys:
+            if len(parsed) == 1 and key in parsed:
+                inner = parsed[key]
+                if isinstance(inner, str):
+                    try:
+                        inner = self._safe_json_parse(inner)
+                    except Exception:
+                        return parsed
+                if isinstance(inner, dict):
+                    # Recurse once in case of multiple wrapping layers.
+                    return self._unwrap_response_payload(inner, response_format)
+
+        return parsed
         
 
     def _resolve_response_format(self, row, response_format):
@@ -666,7 +817,7 @@ class TranscriptExtractionAgent(BaseToolAgent):
         include_columns: list[str] = None,
         token_threshold: int = 500,
         max_retries: int = 3,
-        retrieval_only_evidence:bool =True,
+        retrieval_only_evidence:bool =False,
         **kwargs,
     ) -> pd.DataFrame:
         """

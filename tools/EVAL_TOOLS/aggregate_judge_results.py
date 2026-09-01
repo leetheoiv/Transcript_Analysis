@@ -53,11 +53,17 @@ STRENGTH_MAP = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
 
 def _discover_fields(df: pd.DataFrame) -> list[str]:
-    """Identify unique field prefixes from _GROUNDED columns."""
+    """Identify unique field prefixes from _GROUNDED columns.
+
+    Skips empty prefixes, which arise from phantom/claim-less field groups
+    (e.g. a stray ``_GROUNDED`` column with no field name). Including them
+    would inflate judgment counts with junk rows.
+    """
     return [
-        col[: -len(_GROUNDED)]
+        prefix
         for col in df.columns
         if col.endswith(_GROUNDED)
+        and (prefix := col[: -len(_GROUNDED)]).strip()
     ]
 
 
@@ -451,10 +457,39 @@ def _derive_prompt_lessons(
         "wrong_extraction": "Do not extract values from unrelated parts of the transcript.",
     }
 
+    # Detect whether "unsupported_claim" failures are likely driven by the
+    # JUDGE failing to retrieve evidence rather than the EXTRACTOR inventing a
+    # value. If the judge marked a claim unsupported but its own retrieval found
+    # no evidence chunk at all, that is at least as likely a retrieval miss as a
+    # true hallucination. Blindly telling the extractor to "stop extracting"
+    # in that case suppresses correct answers and degrades the prompt.
+    retrieval_miss_share = 0.0
+    unsupported = long_df[
+        long_df["error_type"].astype(str).str.strip() == "unsupported_claim"
+    ]
+    if not unsupported.empty and "evidence_found" in unsupported.columns:
+        retrieval_miss_share = float((~unsupported["evidence_found"].astype(bool)).mean())
+
     for es in error_summaries[:5]:
         lesson = error_type_lessons.get(es.error_type)
-        if lesson:
-            stop_doing.append(f"{lesson} (seen {es.total_count}x across fields: {', '.join(es.top_fields[:3])})")
+        if not lesson:
+            continue
+        # Soften the "unsupported_claim" lesson when most such failures coincide
+        # with the judge finding no evidence — the fix may belong to evidence
+        # retrieval / the judge, not the extraction prompt.
+        if es.error_type == "unsupported_claim" and retrieval_miss_share >= 0.5:
+            stop_doing.append(
+                f"{lesson} — BUT NOTE: {retrieval_miss_share:.0%} of these "
+                "'unsupported' cases had NO evidence retrieved by the judge at all. "
+                "Before suppressing extractions, verify the claim is genuinely "
+                "absent from the transcript rather than a judge evidence-retrieval "
+                "miss. Prefer tightening WHEN to extract over refusing to extract. "
+                f"(seen {es.total_count}x across fields: {', '.join(es.top_fields[:3])})"
+            )
+        else:
+            stop_doing.append(
+                f"{lesson} (seen {es.total_count}x across fields: {', '.join(es.top_fields[:3])})"
+            )
 
     # Generic stop_doing for high hallucination
     total_judgments = len(long_df)

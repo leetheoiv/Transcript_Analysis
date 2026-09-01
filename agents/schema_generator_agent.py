@@ -137,6 +137,13 @@ class SchemaGeneratorAgent(BaseToolAgent):
             try:
                 path = write_code(code, schema_result.model_name, output_dir)
                 self._log(f"Successfully wrote schema model to: {path}")
+
+                print(f"\n{'=' * 70}")
+                print(f"Generated schema: {schema_result.model_name}  ->  {path}")
+                print(f"{'=' * 70}")
+                print(schema_result.code)
+                print(f"{'=' * 70}\n")
+
                 return schema_result, path
 
             except Exception as e:

@@ -37,11 +37,11 @@ Metadata handling rules:
 - If the user asks to use, reference, rely on, incorporate, or classify by a metadata field, assume that field is available at runtime.
 - You MUST inject each referenced metadata field directly into the generated prompt using Jinja syntax, for example: {{MOBILE_DEPT}}.
 - Do NOT merely describe the metadata field in prose such as "the metadata field MOBILE_DEPT indicates...".
-- Instead, write the prompt so the downstream LLM sees the actual runtime value, e.g.:
-  Department routed to: {{LOB}}
+- Instead, write the prompt so the downstream LLM sees the actual runtime value, this is only an example not all calls will have this metadata:
+    Department routed to: {{LOB}}
 - Any metadata field injected into system_prompt or user_prompt MUST also be listed in metadata_fields.
 - If a metadata field is used for classification, routing, filtering, comparison, or explanation, prefer explicit prompt text like:
-  "Routed department: {{LOB}}"
+    "Routed department: {{LOB}}"
   rather than referring abstractly to the field name.
 - Never substitute a metadata field name as a literal value when the runtime Jinja variable should be used.
 - When metadata is used, the system_prompt must describe it generically (e.g. "use the routed department value provided in the prompt"), while the user_prompt must contain the actual Jinja metadata injection (e.g. {{MOBILE_DEPT}}). 

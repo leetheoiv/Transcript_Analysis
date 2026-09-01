@@ -121,9 +121,19 @@ class ExtractionBootstrapEvaluator:
             df: pd.DataFrame,
             grounded_suffix: str = "_GROUNDED",
             hallucinated_suffix: str = "_HALLUCINATED",
+            retrieval_status_suffix: str = "_RETRIEVAL_STATUS",
         ) -> tuple[SemanticQuality, dict[str, float], dict[str, float]]:
             """
             Evaluate correctness and hallucination from a judge output dataframe.
+
+            Option C: when a ``{field}_RETRIEVAL_STATUS`` column is present, any
+            judgment marked ``retrieval_failure`` is EXCLUDED from the correctness
+            denominator — the judge could not retrieve evidence, so it cannot be
+            counted against the extractor. The proportion of such exclusions is
+            surfaced as ``retrieval_failure_rate`` instead of silently dropped.
+
+            Falls back to the original grounded-based correctness when no
+            retrieval-status column exists (backward compatible with old results).
 
             Returns:
                 (
@@ -144,6 +154,8 @@ class ExtractionBootstrapEvaluator:
             total_hallucination_count = 0
             total_grounded_evaluated = 0
             total_hallucination_evaluated = 0
+            total_retrieval_failures = 0
+            total_judged_before_exclusion = 0
 
             per_field_correctness_rate = {}
             per_field_hallucination_rate = {}
@@ -156,17 +168,47 @@ class ExtractionBootstrapEvaluator:
             for grounded_col in grounded_cols:
                 field_name = grounded_col[: -len(grounded_suffix)]
 
+                # Skip phantom/claim-less columns (empty field name). Including
+                # them would count junk judgments toward correctness.
+                if not field_name.strip():
+                    continue
+
                 grounded_series = df[grounded_col].dropna()
                 grounded_total = len(grounded_series)
-                grounded_true_count = int((grounded_series == True).sum())
+
+                # Option C: exclude retrieval failures from the correctness
+                # denominator when the retrieval-status column is available.
+                retrieval_col = f"{field_name}{retrieval_status_suffix}"
+                if retrieval_col in df.columns:
+                    status_series = df[retrieval_col]
+                    # Align to the same rows we counted for grounding
+                    status_aligned = status_series.loc[grounded_series.index]
+                    is_retrieval_failure = (
+                        status_aligned.astype(str).str.strip() == "retrieval_failure"
+                    )
+                    field_retrieval_failures = int(is_retrieval_failure.sum())
+
+                    # Judgeable rows = grounded judgments that were NOT retrieval failures
+                    judgeable_mask = ~is_retrieval_failure.values
+                    judgeable_grounded = grounded_series[judgeable_mask]
+                    field_judgeable_total = len(judgeable_grounded)
+                    field_correct_count = int((judgeable_grounded == True).sum())
+                else:
+                    # Backward-compatible fallback: no retrieval-status info
+                    field_retrieval_failures = 0
+                    field_judgeable_total = grounded_total
+                    field_correct_count = int((grounded_series == True).sum())
 
                 correctness_rate = (
-                    grounded_true_count / grounded_total if grounded_total > 0 else 0.0
+                    field_correct_count / field_judgeable_total
+                    if field_judgeable_total > 0 else 0.0
                 )
                 per_field_correctness_rate[field_name] = correctness_rate
 
-                total_correctness_count += grounded_true_count
-                total_grounded_evaluated += grounded_total
+                total_correctness_count += field_correct_count
+                total_grounded_evaluated += field_judgeable_total
+                total_retrieval_failures += field_retrieval_failures
+                total_judged_before_exclusion += grounded_total
 
                 hallucinated_col = hallucination_map.get(field_name)
                 if hallucinated_col and hallucinated_col in df.columns:
@@ -199,6 +241,12 @@ class ExtractionBootstrapEvaluator:
                 hallucination_count=total_hallucination_count,
                 total_samples=total_samples,
                 total_evaluated=total_grounded_evaluated,
+                retrieval_failure_count=total_retrieval_failures,
+                retrieval_failure_rate=(
+                    total_retrieval_failures / total_judged_before_exclusion
+                    if total_judged_before_exclusion > 0 else 0.0
+                ),
+                correctness_source="judge",
             )
 
             return semantic_quality, per_field_correctness_rate, per_field_hallucination_rate

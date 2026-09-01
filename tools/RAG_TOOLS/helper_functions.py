@@ -24,7 +24,9 @@ from tools.utils.normalize_txt import _normalize_text,_tokenize
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# This file lives at <project_root>/tools/RAG_TOOLS/, so the project root is
+# three levels up (RAG_TOOLS -> tools -> project_root).
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_RAG_FOLDER = PROJECT_ROOT / "knowledge_base"
 
 SUPPORTED_EXTENSIONS = {".md", ".csv", ".txt"}

@@ -33,3 +33,6 @@ redis>=5.0
 fastapi>=0.141.1
 uvicorn[standard]>=0.34.0
 python-multipart>=0.0.20
+
+# JSON repair for tolerant parsing of malformed model output
+json-repair>=0.25

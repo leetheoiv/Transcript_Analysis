@@ -16,6 +16,21 @@ class JudgeFieldResult(BaseModel):
     grounded: bool
     evidence_strength: Literal["none", "low", "medium", "high"]
     evidence_found: bool
+    # Distinguishes WHY a claim is ungrounded so retrieval failures are not
+    # blamed on the extractor:
+    #   - supported: evidence retrieved and it supports the claim
+    #   - contradicted: evidence retrieved and it contradicts the claim
+    #     (a genuine extraction error / hallucination)
+    #   - absent_from_transcript: evidence retrieved for the surrounding context
+    #     but the claimed fact is genuinely not present (genuine extraction error)
+    #   - retrieval_failure: no usable evidence could be retrieved, so grounding
+    #     cannot be judged either way (NOT the extractor's fault)
+    retrieval_status: Literal[
+        "supported",
+        "contradicted",
+        "absent_from_transcript",
+        "retrieval_failure",
+    ] = "retrieval_failure"
     evidence_chunk: str = ""
     hallucinated: bool = False
     search_terms_used: list[str] = []
@@ -52,6 +67,16 @@ class GroundingJudgeLLMResponse(BaseModel):
     grounded: bool
     hallucinated: bool
     evidence_strength: Literal["none", "low", "medium", "high"]
+    # Given ONLY the retrieved evidence, how does the claim relate to it?
+    #   - supported: the evidence supports the claim
+    #   - contradicted: the evidence directly contradicts the claim
+    #   - absent: the evidence is relevant context but does not contain the
+    #     claimed fact (the claim appears genuinely absent from the transcript)
+    #   - no_evidence: no usable evidence was provided to evaluate against
+    # This lets the harness separate genuine extraction errors (contradicted /
+    # absent) from cases the judge simply could not retrieve evidence for
+    # (no_evidence), which should not be counted against extraction correctness.
+    claim_presence: Literal["supported", "contradicted", "absent", "no_evidence"] = "no_evidence"
     explanation: str = ""
     error_type: Optional[Literal[
         "unsupported_claim",

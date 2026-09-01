@@ -197,6 +197,43 @@ class PromptGeneratorAgent(BaseToolAgent):
         except Exception:
             return "generate"
 
+    def _print_generated_prompt(self, prompt_model: PromptModel) -> None:
+        """Print the generated prompt cleanly, with real newlines for readability.
+
+        The prompt strings come back from JSON with escaped ``\\n`` sequences.
+        Printing the string values directly renders them as real line breaks so
+        the system/user prompts are easy to read in the console.
+
+        Args:
+            prompt_model: The validated PromptModel to display.
+        """
+        import json
+
+        divider = "=" * 70
+
+        print(f"\n{divider}")
+        print("GENERATED PROMPT")
+        print(divider)
+
+        print("\n--- SYSTEM PROMPT ---\n")
+        print(prompt_model.system_prompt)
+
+        print("\n--- USER PROMPT ---\n")
+        print(prompt_model.user_prompt)
+
+        if prompt_model.metadata_fields:
+            print("\n--- METADATA FIELDS ---\n")
+            for field in prompt_model.metadata_fields:
+                print(f"  - {field}")
+
+        print("\n--- OUTPUT FORMAT ---\n")
+        print(json.dumps(prompt_model.output_format, indent=2, ensure_ascii=False))
+
+        if prompt_model.saved_location_of_prompt:
+            print(f"\nSaved location: {prompt_model.saved_location_of_prompt}")
+
+        print(f"{divider}\n")
+
     def run(self, user_input: str, answers=None, revision_brief=None, temperature=0.6, max_retries=2, force_generate=False):
         """Run the prompt generator agent with automatic intent classification.
 
@@ -256,6 +293,7 @@ class PromptGeneratorAgent(BaseToolAgent):
             try:
                 validated = PromptModel.model_validate(self._safe_json_parse(text))
                 self.messages.append({"role": "assistant", "content": text})
+                self._print_generated_prompt(validated)
                 return validated
             except Exception as e:
                 if attempt == max_retries:

@@ -74,7 +74,21 @@ class SpectrumClient:
     # -----------------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------------
-    def count_tokens(self,text: str) -> int:
+    def count_tokens(self, text: str) -> int:
+        # Coerce non-string input (e.g. pandas NaN floats, None) to a safe string.
+        # tiktoken.encode on a float raises "argument of type 'float' is not iterable".
+        if not isinstance(text, str):
+            if text is None:
+                text = ""
+            else:
+                try:
+                    import math
+                    if isinstance(text, float) and math.isnan(text):
+                        text = ""
+                    else:
+                        text = str(text)
+                except Exception:
+                    text = str(text)
         enc = tiktoken.encoding_for_model(self.model)
         return len(enc.encode(text))
 
@@ -149,13 +163,55 @@ class SpectrumClient:
         return payload
 
     def _safe_json_parse(self, text: str) -> dict:
-        
-        """Parse JSON, repairing invalid escapes and malformed output from the model."""
+
+        """Parse JSON, repairing invalid escapes and malformed output from the model.
+
+        Strategy (most reliable first):
+          1. Strict json.loads.
+          2. Repair invalid backslash escapes, then json.loads.
+          3. json_repair for structurally broken JSON.
+          4. Only as a last resort, when the text is clearly NOT a JSON
+             object/array, fall back to a crude line-by-line key:value parse.
+
+        The line-by-line fallback is deliberately gated behind the structured
+        parsers. Running it first would mangle valid-but-slightly-broken JSON
+        (e.g. a single-line ``{...}`` blob) into a garbage single-key dict by
+        splitting on the first colon.
+        """
+        if not isinstance(text, str):
+            # Already parsed upstream (dict/list) — hand it straight back.
+            return text
+
+        stripped = text.strip()
+
+        # 1. Strict parse.
         try:
-            return json.loads(text)
+            return json.loads(stripped)
         except json.JSONDecodeError:
+            pass
+
+        # 2. Repair invalid escapes (e.g. \' produced by str() of a Python dict)
+        #    and drop stray backslashes that aren't valid JSON escapes.
+        fixed = re.sub(r"\\'", "'", stripped)
+        fixed = re.sub(r'\\([^"\\\/bfnrtu])', r'\1', fixed)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+
+        # 3. Structural repair for JSON-shaped payloads.
+        looks_like_json = stripped.startswith(("{", "["))
+        if looks_like_json:
+            repaired = self._try_json_repair(fixed)
+            if isinstance(repaired, (dict, list)):
+                return repaired
+
+        # 4. Last-resort line-by-line parse — only for clearly non-JSON text.
+        #    Never applied to text that starts with { or [ so we don't corrupt
+        #    a mangled-but-recoverable JSON object into a single bogus key.
+        if not looks_like_json:
             result = {}
-            lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+            lines = [l.strip() for l in stripped.splitlines() if l.strip()]
             for i, line in enumerate(lines):
                 if line.endswith(':'):
                     key = line[:-1].strip()
@@ -169,13 +225,34 @@ class SpectrumClient:
                         result[key] = value
             if result:
                 return result
-            fixed = re.sub(r"\\'", "'", text)
-            fixed = re.sub(r'\\([^"\\\/bfnrtu])', r'\1', fixed)
-            try:
-                return json.loads(fixed)
-            except json.JSONDecodeError:
-                from json_repair import repair_json
-                return json.loads(repair_json(fixed))
+
+        # 5. Absolute fallback: let json_repair try even on non-JSON-looking
+        #    text so callers still get a best-effort dict instead of a crash.
+        repaired = self._try_json_repair(fixed)
+        if repaired is not None:
+            return repaired
+
+        # json_repair unavailable and nothing else worked. Raise a clear error
+        # rather than silently returning garbage that fails downstream validation.
+        raise ValueError(
+            "Could not parse model output as JSON and json_repair is unavailable. "
+            "Install it with: pip install json-repair"
+        )
+
+    def _try_json_repair(self, text: str):
+        """Attempt structural JSON repair, tolerating a missing json_repair package.
+
+        Returns the parsed object on success, or None if repair is unavailable
+        or fails. Never raises.
+        """
+        try:
+            from json_repair import repair_json
+        except ImportError:
+            return None
+        try:
+            return json.loads(repair_json(text))
+        except Exception:
+            return None
 
     def flatten_dict(self,d, parent_key="", sep="__"):
         items = []

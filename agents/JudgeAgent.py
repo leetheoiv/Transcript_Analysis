@@ -28,6 +28,7 @@ from data_models.refine_search_terms_datamodel import RefinedSearchTermsResponse
 import csv
 import os
 import math
+import re
 
 class JudgeAgent(BaseToolAgent):
     """Agent that evaluates whether extracted field-level claims are grounded in transcript evidence.
@@ -168,6 +169,7 @@ class JudgeAgent(BaseToolAgent):
             output[f"{prefix}_HALLUCINATED"] = result.hallucinated
             output[f"{prefix}_EVIDENCE_STRENGTH"] = result.evidence_strength
             output[f"{prefix}_EVIDENCE_FOUND"] = result.evidence_found
+            output[f"{prefix}_RETRIEVAL_STATUS"] = result.retrieval_status
             output[f"{prefix}_EVIDENCE_CHUNK"] = result.evidence_chunk
             output[f"{prefix}_SEARCH_TERMS_USED"] = " | ".join(result.search_terms_used) if result.search_terms_used else ""
             output[f"{prefix}_JUDGE_EXPLANATION"] = result.explanation
@@ -288,6 +290,46 @@ class JudgeAgent(BaseToolAgent):
                 snippets.append(snippet)
 
         return snippets
+
+    @staticmethod
+    def _verbatim_evidence(formatted_chunk: str) -> str:
+        """Strip retrieval annotations to recover the verbatim transcript text.
+
+        The retriever returns chunks decorated with a "Search term: ..." header
+        and "[line N] " prefixes for the LLM's benefit. For the STORED evidence
+        we want the raw transcript lines exactly as they appear, with no added
+        labels or line numbers.
+
+        Args:
+            formatted_chunk: The labeled/line-numbered chunk from the retriever.
+
+        Returns:
+            The verbatim transcript lines joined by newlines. Placeholder markers
+            like "[No relevant evidence found.]" or "... [YIELDED NO RESULTS]"
+            are passed through unchanged.
+        """
+        if not formatted_chunk:
+            return ""
+
+        # Placeholders / no-result markers: keep as-is (they aren't transcript).
+        stripped = formatted_chunk.strip()
+        if stripped.startswith("[") and "line" not in stripped.split("]", 1)[0]:
+            # e.g. "[No relevant evidence found.]" / "[NO SEARCH TERMS GENERATED]"
+            return formatted_chunk
+
+        out_lines: list[str] = []
+        for line in formatted_chunk.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            # Drop the "Search term: ..." header line(s).
+            if s.startswith("Search term:"):
+                continue
+            # Strip a leading "[line N] " prefix if present, else keep verbatim.
+            m = re.match(r"^\[line\s+\d+\]\s?(.*)$", s)
+            out_lines.append(m.group(1) if m else line)
+
+        return "\n".join(out_lines)
 
     def _retrieve_evidence(
         self,
@@ -498,6 +540,27 @@ class JudgeAgent(BaseToolAgent):
         if validated.grounded:
             hallucinated = False
 
+        # Derive retrieval_status so the harness can separate genuine extraction
+        # errors from cases where the judge simply could not retrieve evidence.
+        # Retrieval failure is authoritative: if nothing usable was retrieved, or
+        # the LLM itself reports no_evidence, we cannot blame the extractor.
+        if not evidence_found or validated.claim_presence == "no_evidence":
+            retrieval_status = "retrieval_failure"
+        elif validated.claim_presence == "supported":
+            retrieval_status = "supported"
+        elif validated.claim_presence == "contradicted":
+            retrieval_status = "contradicted"
+        elif validated.claim_presence == "absent":
+            retrieval_status = "absent_from_transcript"
+        else:
+            # Fallback: infer from grounded when claim_presence is unexpected
+            retrieval_status = "supported" if validated.grounded else "retrieval_failure"
+
+        # Store the VERBATIM transcript text (strip the "Search term:" header and
+        # "[line N]" prefixes the retriever added for the LLM). The judged verdict
+        # was still made against the same lines — we just persist them raw.
+        verbatim_evidence = self._verbatim_evidence(evidence_chunk)
+
         return JudgeFieldResult(
             field_name=field_input.field_name,
             claim_value=field_input.claim_value,
@@ -505,7 +568,8 @@ class JudgeAgent(BaseToolAgent):
             hallucinated=hallucinated,
             evidence_strength=validated.evidence_strength,
             evidence_found=evidence_found,
-            evidence_chunk=evidence_chunk,
+            retrieval_status=retrieval_status,
+            evidence_chunk=verbatim_evidence,
             search_terms_used=search_terms_used,
             explanation=validated.explanation,
             error_type=validated.error_type,

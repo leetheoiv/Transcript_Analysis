@@ -245,7 +245,29 @@ class BaseToolAgent(SpectrumClient):
             Stripped text string.
         """
         if isinstance(result, dict) and "response" in result:
-            return str(result["response"]).strip()
+            # chat() can return nested {'response': {'response': ...}} when the
+            # model chains tool calls (each recursive chat() re-wraps its result).
+            # Drill down through nested 'response' keys until we reach a non-dict
+            # payload, so we never stringify a dict via repr (which yields
+            # invalid JSON like "{'response': ...}" that breaks validation).
+            payload = result
+            seen = 0
+            while (
+                isinstance(payload, dict)
+                and "response" in payload
+                and isinstance(payload["response"], dict)
+                and seen < 10
+            ):
+                payload = payload["response"]
+                seen += 1
+
+            inner = payload.get("response", payload) if isinstance(payload, dict) else payload
+
+            if isinstance(inner, (dict, list)):
+                # Real structured content — emit valid JSON, not a Python repr.
+                return json.dumps(inner, ensure_ascii=False).strip()
+
+            return str(inner).strip()
 
         return self._extract_text(result).strip()
 

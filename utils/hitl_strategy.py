@@ -228,13 +228,36 @@ class AsyncHITL:
         """
         Make the review item JSON-serializable.
 
-        The Orchestrator passes dicts and strings — this handles edge cases
-        like Pydantic models or other objects.
+        The Orchestrator passes dicts, strings, Pydantic model *instances*
+        (e.g. prompt artifacts) AND Pydantic model *classes* (the generated
+        schema is a class, not an instance). All are handled here.
         """
         if isinstance(item, dict):
-            # Recursively ensure all values are serializable
-            return {k: str(v) if not isinstance(v, (str, int, float, bool, type(None), dict, list)) else v
-                    for k, v in item.items()}
-        if hasattr(item, "model_dump"):
-            return item.model_dump()
+            # Recursively serialize each value the same way
+            return {k: AsyncHITL._serialize_review_item(v) for k, v in item.items()}
+
+        if isinstance(item, (list, tuple)):
+            return [AsyncHITL._serialize_review_item(v) for v in item]
+
+        if isinstance(item, (str, int, float, bool, type(None))):
+            return item
+
+        # A Pydantic model CLASS (e.g. the generated schema). Calling
+        # model_dump() on a class fails with "missing 'self'", so use the
+        # class-level JSON schema instead.
+        if isinstance(item, type):
+            if hasattr(item, "model_json_schema"):
+                try:
+                    return item.model_json_schema()
+                except Exception:  # noqa: BLE001
+                    return str(item)
+            return str(item)
+
+        # A Pydantic model INSTANCE.
+        if hasattr(item, "model_dump") and not isinstance(item, type):
+            try:
+                return item.model_dump()
+            except Exception:  # noqa: BLE001
+                return str(item)
+
         return str(item)
